@@ -48,9 +48,10 @@ class AgentTool(BaseTool):
     skip_summarization: Whether to skip summarization of the agent output.
   """
 
-  def __init__(self, agent: BaseAgent, skip_summarization: bool = False):
+  def __init__(self, agent: BaseAgent, skip_summarization: bool = False, inherit_parent_session: bool = False):
     self.agent = agent
     self.skip_summarization: bool = skip_summarization
+    self.inherit_parent_session: bool = inherit_parent_session
 
     super().__init__(name=agent.name, description=agent.description)
 
@@ -134,11 +135,24 @@ class AgentTool(BaseTool):
         memory_service=InMemoryMemoryService(),
         credential_service=tool_context._invocation_context.credential_service,
     )
+    # Create a child session seeded with the parent's current state and user id.
+    parent_ctx = tool_context._invocation_context
     session = await runner.session_service.create_session(
         app_name=self.agent.name,
-        user_id='tmp_user',
+        user_id=parent_ctx.user_id,
         state=tool_context.state.to_dict(),
     )
+
+    # Optionally inherit parent session events so the wrapped agent has conversation context.
+    if self.inherit_parent_session:
+      parent_branch = parent_ctx.branch
+      for parent_event in parent_ctx.session.events:
+        if parent_branch and parent_event.branch and not parent_branch.startswith(parent_event.branch):
+          continue
+        event_copy = parent_event.model_copy(deep=True)
+        if event_copy.actions and event_copy.actions.state_delta:
+          event_copy.actions.state_delta = {}
+        await runner.session_service.append_event(session=session, event=event_copy)
 
     last_event = None
     async for event in runner.run_async(
@@ -173,7 +187,9 @@ class AgentTool(BaseTool):
         agent_tool_config.agent, config_abs_path
     )
     return cls(
-        agent=agent, skip_summarization=agent_tool_config.skip_summarization
+        agent=agent,
+        skip_summarization=agent_tool_config.skip_summarization,
+        inherit_parent_session=agent_tool_config.inherit_parent_session,
     )
 
 
@@ -185,3 +201,6 @@ class AgentToolConfig(BaseToolConfig):
 
   skip_summarization: bool = False
   """Whether to skip summarization of the agent output."""
+
+  inherit_parent_session: bool = False
+  """Whether to inherit parent session events into the tool's session."""
