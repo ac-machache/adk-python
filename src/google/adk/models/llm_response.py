@@ -94,6 +94,22 @@ class LlmResponse(BaseModel):
   ] = None
   """The session resumption update of the LlmResponse"""
 
+  generation_complete: Optional[bool] = None
+  """Indicates that the model has finished generating content.
+  Only used for streaming mode.
+  """
+
+  goaway: Optional[types.LiveServerGoAway] = None
+  """Notification that the server will soon disconnect.
+  
+  Contains timeLeft field indicating remaining time before the connection 
+  is terminated as "ABORTED". The duration will never be less than a 
+  model-specific minimum duration specified with the model's rate limits.
+  """
+
+  setup_complete: Optional[bool] = None
+  """Indicates that the model has been set up successfully."""
+
   @staticmethod
   def create(
       generate_content_response: types.GenerateContentResponse,
