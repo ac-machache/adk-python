@@ -128,7 +128,7 @@ class AgentTool(BaseTool):
           parts=[types.Part.from_text(text=args['request'])],
       )
     runner = Runner(
-        app_name=self.agent.name,
+        app_name=tool_context._invocation_context.app_name,
         agent=self.agent,
         artifact_service=ForwardingArtifactService(tool_context),
         session_service=InMemorySessionService(),
