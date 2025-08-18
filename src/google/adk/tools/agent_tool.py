@@ -138,7 +138,7 @@ class AgentTool(BaseTool):
     # Create a child session seeded with the parent's current state and user id.
     parent_ctx = tool_context._invocation_context
     session = await runner.session_service.create_session(
-        app_name=self.agent.name,
+        app_name=tool_context._invocation_context.app_name,
         user_id=parent_ctx.user_id,
         state=tool_context.state.to_dict(),
     )
