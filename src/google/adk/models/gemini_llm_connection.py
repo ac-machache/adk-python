@@ -190,6 +190,16 @@ class GeminiLlmConnection(BaseLlmConnection):
         if message.server_content:
           content = message.server_content.model_turn
           if content and content.parts:
+            # Sanitize: Drop executable code and code execution result parts in live mode
+            sanitized_parts = [
+                p for p in content.parts
+                if not (getattr(p, 'executable_code', None)
+                        or getattr(p, 'code_execution_result', None))
+            ]
+            if not sanitized_parts:
+              # Skip emitting this chunk if nothing remains after sanitization
+              continue
+            content = types.Content(role=content.role, parts=sanitized_parts)
             llm_response = LlmResponse(
                 content=content, interrupted=message.server_content.interrupted
             )
