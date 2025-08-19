@@ -97,6 +97,9 @@ class LlmResponse(BaseModel):
   ] = None
   """The session resumption update of the LlmResponse"""
 
+  setup_complete: Optional[bool] = None
+  """Indicates that the model has been set up successfully."""
+
   @staticmethod
   def create(
       generate_content_response: types.GenerateContentResponse,

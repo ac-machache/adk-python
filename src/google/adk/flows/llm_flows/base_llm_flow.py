@@ -112,6 +112,15 @@ class BaseLlmFlow(ABC):
             invocation_context.agent.name,
         )
         async with llm.connect(llm_request) as llm_connection:
+          # Signal that live setup is complete so UIs can transition promptly.
+          # Event does not support a dedicated setup_complete flag, so we use
+          # custom_metadata to carry this signal.
+          yield Event(
+              invocation_id=invocation_context.invocation_id,
+              author=invocation_context.agent.name,
+              custom_metadata={'setup_complete': True},
+              partial=True,
+          )
           if llm_request.contents:
             # Sends the conversation history to the model.
             with tracer.start_as_current_span('send_data'):
@@ -135,64 +144,81 @@ class BaseLlmFlow(ABC):
                     invocation_context, event_id, llm_request.contents
                 )
 
-          send_task = asyncio.create_task(
-              self._send_to_model(llm_connection, invocation_context)
-          )
+          # Run send and receive in parallel and multiplex their events through
+          # a local queue so we can preserve ordering and centralize handling.
+          event_queue: asyncio.Queue[Optional[Event]] = asyncio.Queue()
 
-          try:
+          async def send_handler():
             async with Aclosing(
-                self._receive_from_model(
-                    llm_connection,
-                    event_id,
-                    invocation_context,
-                    llm_request,
-                )
+                self._send_to_model(llm_connection, invocation_context)
             ) as agen:
               async for event in agen:
-                # Empty event means the queue is closed.
-                if not event:
-                  break
-                logger.debug('Receive new event: %s', event)
-                yield event
-                # send back the function response
-                if event.get_function_responses():
-                  logger.debug(
-                      'Sending back last function response event: %s', event
+                await event_queue.put(event)
+
+          async def receive_handler():
+            try:
+              async with Aclosing(
+                  self._receive_from_model(
+                      llm_connection,
+                      event_id,
+                      invocation_context,
+                      llm_request,
                   )
-                  invocation_context.live_request_queue.send_content(
-                      event.content
-                  )
-                if (
+              ) as agen:
+                async for event in agen:
+                  await event_queue.put(event)
+            finally:
+              # Signal that receiving is complete.
+              await event_queue.put(None)
+
+          send_task = asyncio.create_task(send_handler())
+          receive_task = asyncio.create_task(receive_handler())
+          tasks = {send_task, receive_task}
+
+          try:
+            while True:
+              event = await event_queue.get()
+              if event is None:
+                break
+              logger.debug('Receive new event: %s', event)
+              yield event
+              # send back the function response
+              if event.get_function_responses():
+                logger.debug(
+                    'Sending back last function response event: %s', event
+                )
+                invocation_context.live_request_queue.send_content(
                     event.content
-                    and event.content.parts
-                    and event.content.parts[0].function_response
-                    and event.content.parts[0].function_response.name
-                    == 'transfer_to_agent'
-                ):
-                  await asyncio.sleep(1)
-                  # cancel the tasks that belongs to the closed connection.
-                  send_task.cancel()
-                  await llm_connection.close()
-                if (
-                    event.content
-                    and event.content.parts
-                    and event.content.parts[0].function_response
-                    and event.content.parts[0].function_response.name
-                    == 'task_completed'
-                ):
-                  # this is used for sequential agent to signal the end of the agent.
-                  await asyncio.sleep(1)
-                  # cancel the tasks that belongs to the closed connection.
-                  send_task.cancel()
-                  return
+                )
+              if (
+                  event.content
+                  and event.content.parts
+                  and event.content.parts[0].function_response
+                  and event.content.parts[0].function_response.name
+                  == 'transfer_to_agent'
+              ):
+                await asyncio.sleep(1)
+                # cancel the tasks that belongs to the closed connection.
+                send_task.cancel()
+                await llm_connection.close()
+              if (
+                  event.content
+                  and event.content.parts
+                  and event.content.parts[0].function_response
+                  and event.content.parts[0].function_response.name
+                  == 'task_completed'
+              ):
+                # this is used for sequential agent to signal the end of the agent.
+                await asyncio.sleep(1)
+                # cancel the tasks that belongs to the closed connection.
+                send_task.cancel()
+                return
           finally:
             # Clean up
-            if not send_task.done():
-              send_task.cancel()
-            try:
-              await send_task
-            except asyncio.CancelledError:
-              pass
+            for task in tasks:
+              if not task.done():
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
       except (ConnectionClosed, ConnectionClosedOK) as e:
         # when the session timeout, it will just close and not throw exception.
         # so this is for bad cases
