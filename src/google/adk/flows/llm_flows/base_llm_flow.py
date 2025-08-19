@@ -112,13 +112,11 @@ class BaseLlmFlow(ABC):
             invocation_context.agent.name,
         )
         async with llm.connect(llm_request) as llm_connection:
-          # Signal that live setup is complete so UIs can transition promptly.
-          # Event does not support a dedicated setup_complete flag, so we use
-          # custom_metadata to carry this signal.
+          # Signal setup_complete early so UIs can transition
           yield Event(
               invocation_id=invocation_context.invocation_id,
               author=invocation_context.agent.name,
-              custom_metadata={'setup_complete': True},
+              setup_complete=True,
               partial=True,
           )
           if llm_request.contents:
@@ -144,16 +142,12 @@ class BaseLlmFlow(ABC):
                     invocation_context, event_id, llm_request.contents
                 )
 
-          # Run send and receive in parallel and multiplex their events through
-          # a local queue so we can preserve ordering and centralize handling.
-          event_queue: asyncio.Queue[Optional[Event]] = asyncio.Queue()
+          # Fan-in send/receive via a local queue to centralize ordering
+          event_queue: asyncio.Queue[Event | None] = asyncio.Queue()
 
           async def send_handler():
-            async with Aclosing(
-                self._send_to_model(llm_connection, invocation_context)
-            ) as agen:
-              async for event in agen:
-                await event_queue.put(event)
+            async for ev in self._send_to_model(llm_connection, invocation_context):
+              await event_queue.put(ev)
 
           async def receive_handler():
             try:
@@ -165,60 +159,48 @@ class BaseLlmFlow(ABC):
                       llm_request,
                   )
               ) as agen:
-                async for event in agen:
-                  await event_queue.put(event)
+                async for ev in agen:
+                  await event_queue.put(ev)
             finally:
-              # Signal that receiving is complete.
               await event_queue.put(None)
 
           send_task = asyncio.create_task(send_handler())
-          receive_task = asyncio.create_task(receive_handler())
-          tasks = {send_task, receive_task}
+          recv_task = asyncio.create_task(receive_handler())
 
           try:
             while True:
-              event = await event_queue.get()
-              if event is None:
+              ev = await event_queue.get()
+              if ev is None:
                 break
-              logger.debug('Receive new event: %s', event)
-              yield event
-              # send back the function response
-              if event.get_function_responses():
-                logger.debug(
-                    'Sending back last function response event: %s', event
-                )
-                invocation_context.live_request_queue.send_content(
-                    event.content
-                )
+              logger.debug('Receive new event: %s', ev)
+              yield ev
+              if ev.get_function_responses():
+                invocation_context.live_request_queue.send_content(ev.content)
               if (
-                  event.content
-                  and event.content.parts
-                  and event.content.parts[0].function_response
-                  and event.content.parts[0].function_response.name
+                  ev.content
+                  and ev.content.parts
+                  and ev.content.parts[0].function_response
+                  and ev.content.parts[0].function_response.name
                   == 'transfer_to_agent'
               ):
                 await asyncio.sleep(1)
-                # cancel the tasks that belongs to the closed connection.
                 send_task.cancel()
                 await llm_connection.close()
               if (
-                  event.content
-                  and event.content.parts
-                  and event.content.parts[0].function_response
-                  and event.content.parts[0].function_response.name
+                  ev.content
+                  and ev.content.parts
+                  and ev.content.parts[0].function_response
+                  and ev.content.parts[0].function_response.name
                   == 'task_completed'
               ):
-                # this is used for sequential agent to signal the end of the agent.
                 await asyncio.sleep(1)
-                # cancel the tasks that belongs to the closed connection.
                 send_task.cancel()
                 return
           finally:
-            # Clean up
-            for task in tasks:
-              if not task.done():
-                task.cancel()
-            await asyncio.gather(*tasks, return_exceptions=True)
+            for t in (send_task, recv_task):
+              if not t.done():
+                t.cancel()
+            await asyncio.gather(send_task, recv_task, return_exceptions=True)
       except (ConnectionClosed, ConnectionClosedOK) as e:
         # when the session timeout, it will just close and not throw exception.
         # so this is for bad cases
@@ -234,8 +216,8 @@ class BaseLlmFlow(ABC):
       self,
       llm_connection: BaseLlmConnection,
       invocation_context: InvocationContext,
-  ):
-    """Sends data to model."""
+  ) -> AsyncGenerator[Event, None]:
+    """Sends data to model and yields user Events for text messages."""
     while True:
       live_request_queue = invocation_context.live_request_queue
       try:
@@ -282,6 +264,16 @@ class BaseLlmFlow(ABC):
         await llm_connection.send_realtime(live_request.blob)
 
       if live_request.content:
+        # Yield a user event if it's plain user text so history/UI can capture it
+        if (
+            live_request.content.parts
+            and live_request.content.parts[0].text
+        ):
+          yield Event(
+              invocation_id=invocation_context.invocation_id,
+              author='user',
+              content=live_request.content,
+          )
         await llm_connection.send_content(live_request.content)
 
   async def _receive_from_model(
